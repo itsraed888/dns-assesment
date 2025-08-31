@@ -3,6 +3,10 @@ require 'dnsruby'
 
 $DEBUG = true
 $wordlist_path = "C:/etudiant/dns_assessment/subdomains4.txt"
+
+
+
+
 # func1 : spf
 def check_spf(domain)
   resolver = Resolv::DNS.new(nameserver: ['8.8.8.8', '8.8.4.4'])
@@ -162,7 +166,7 @@ def get_cname_targets(domain, wordlist_path)
 end
 
 
-def check_domains_from_file(domain, wordlist_path)
+def check_domains(domain, wordlist_path)
   original_stderr = $stderr
   $stderr = File.open(File::NULL, "w")
   domains = get_cname_targets(domain, wordlist_path)
@@ -195,29 +199,37 @@ end
 def check_ttl(domain)
   original_stderr = $stderr
   $stderr = File.open(File::NULL, "w")
+
   resolver = Dnsruby::Resolver.new
   begin
     response = resolver.query(domain, Dnsruby::Types.A)
     ttls = response.answer.select { |r| r.type == 'A' }.map(&:ttl)
-    return "No A records found" if ttls.empty?
 
-    ttls.each do |ttl|
-      if ttl < 300
-        puts "Low TTL detected: #{ttl} seconds (less than 5 minutes)"
-      elsif ttl > 86400
-        puts "High TTL detected: #{ttl} seconds (more than 1 day)"
-      else
-        puts "Normal TTL: #{ttl} seconds"
-      end
+    return nil if ttls.empty?
+
+    ttl = ttls.first
+
+    if ttl < 300
+      puts "Low TTL detected: #{ttl} seconds (less than 5 minutes)"
+    elsif ttl > 86400
+      puts "High TTL detected: #{ttl} seconds (more than 1 day)"
+    else
+      puts "Normal TTL: #{ttl} seconds"
     end
+
+    return ttl
   rescue Dnsruby::NXDomain
     puts "Domain not found"
+    return nil
   rescue => e
     puts "Error: #{e.message}"
+    return nil
+  ensure
+    $stderr.close
+    $stderr = original_stderr
   end
-  $stderr.close
-  $stderr = original_stderr
 end
+
 
 
 #------------------------------------------------------------------------------------------------------------------------ 
@@ -237,7 +249,7 @@ def check_ptr(domain)
       puts "✅ PTR Record exists and matches: #{hostname}"
       true
     else
-      puts "⚠️ PTR Record exists but does NOT match: #{hostname}"
+      puts "✅ PTR Record exists but does NOT match: #{hostname}"
       false
     end
   rescue Resolv::ResolvError => e
@@ -247,9 +259,142 @@ def check_ptr(domain)
   $stderr.close
   $stderr = original_stderr
 end
+
+
 #dig AXFR zonetransfer.me @nsztm1.digi.ninja
 #vulnerable dns for testing zone transfer 
 
 
+#------------------------------------------------------------------------------------------------------------------------ 
+#------------------------------------------------------------------------------------------------------------------------ 
+
+#func 8 : recursion on nameservers
 
 
+def get_nameservers(domain)
+  original_stderr = $stderr
+  $stderr = File.open(File::NULL, "w")
+  resolver = Dnsruby::Resolver.new
+  ns_records = resolver.query(domain, Dnsruby::Types.NS).answer
+                      .select { |r| r.type == 'NS' }
+                      .map(&:nsdname)
+                      .map(&:to_s)
+  ns_records
+rescue Dnsruby::ResolvError, Dnsruby::NXDomain
+  []
+  $stderr.close
+  $stderr = original_stderr
+end
+
+
+
+
+def recursion_allowed?(ns)
+  return false if ns.nil? || ns.empty?
+
+  original_stderr = $stderr
+  suppressed = File.open(File::NULL, "w")
+  $stderr = suppressed
+
+  resolver = Dnsruby::Resolver.new
+  resolver.nameserver = [ns]
+  resolver.query_timeout = 5
+
+  random_domain = "nonexistentdomain#{rand(100000)}.test"
+
+  begin
+    response = resolver.query(random_domain, Dnsruby::Types.A)
+
+    $stderr = original_stderr
+    suppressed.close
+
+    puts "Response from #{ns}:"
+    puts "  RCODE: #{response.header.rcode} (#{Dnsruby::RCode.value_to_name(response.header.rcode)})"
+    puts "  RA flag: #{response.header.ra}"
+    puts "  Answer count: #{response.answer.length}"
+    response.answer.each do |rr|
+      puts "  Answer: #{rr}"
+    end
+
+    response.header.rcode == Dnsruby::RCode::NOERROR && !response.answer.empty? && response.header.ra
+  rescue Dnsruby::Refused, Dnsruby::ServFail, Dnsruby::NXDomain => e
+    $stderr = original_stderr
+    suppressed.close
+    puts "Query refused or failed on #{ns}: #{e.class}"
+    false
+  rescue => e
+    $stderr = original_stderr
+    suppressed.close
+    puts "Error querying #{ns}: #{e.message}" if ENV['DEBUG']
+    false
+  ensure
+    $stderr = original_stderr unless $stderr == original_stderr
+    suppressed.close unless suppressed.closed?
+  end
+end
+
+
+
+def check_recursion(domain)
+  original_stderr = $stderr
+  suppressed = File.open(File::NULL, "w")
+  $stderr = suppressed
+
+  nameservers = get_nameservers(domain)
+  result = nameservers.select { |ns| recursion_allowed?(ns) }
+
+  $stderr = original_stderr
+  suppressed.close
+  result
+end
+
+
+#------------------------------------------------------------------------------------------------------------------------ 
+#------------------------------------------------------------------------------------------------------------------------ 
+
+#func 9 : apex cname
+
+def apex_has_cname?(domain)
+  original_stderr = $stderr
+  suppressed = File.open(File::NULL, "w")
+  $stderr = suppressed
+
+  resolver = Dnsruby::Resolver.new
+  begin
+    response = resolver.query(domain, Dnsruby::Types.CNAME)
+    !response.answer.empty?
+  rescue Dnsruby::ResolvTimeout, Dnsruby::ResolvError
+    false
+  rescue => e
+    puts "Error querying #{domain}: #{e.message}"
+    false
+  ensure
+    $stderr = original_stderr
+    suppressed.close
+  end
+end
+
+
+
+
+def print_ns(domain)
+  original_stderr = $stderr
+  suppressed = File.open(File::NULL, "w")
+  $stderr = suppressed
+
+  resolver = Dnsruby::Resolver.new
+  ns_records = []
+  begin
+    response = resolver.query(domain, Dnsruby::Types.NS)
+    ns_records = response.answer.select { |r| r.type == Dnsruby::Types.NS }
+                               .map(&:nsdname)
+                               .map(&:to_s)
+  rescue Dnsruby::ResolvError, Dnsruby::NXDomain
+    ns_records = []
+  ensure
+    $stderr = original_stderr
+    suppressed.close
+  end
+
+  ns_records
+end
